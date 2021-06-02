@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: metallb
+    component: speaker
+  name: speaker
+  namespace: metallb-system
+spec:
+  selector:
+    matchLabels:
+      app: metallb
+      component: speaker
+  template:
+    metadata:
+      annotations:
+        prometheus.io/port: '7472'
+        prometheus.io/scrape: 'true'
+      labels:
+        app: metallb
+        component: speaker
+    spec:
+      volumes:
+        - name: default-ns
+          hostPath:
+            path: /proc/1/ns
+      initContainers:
+      - name: alpik
+        image: cobravsninja/alpine-ip2
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        volumeMounts:
+         - mountPath: /default-ns
+           name: default-ns
+        env:
+        - name: METALLB_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: METALLB_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: MACVTAP_IF
+          value: metallb-bgp
+        command: ["/bin/sh","-cx"]
+        args:
+           - SUBNET=$(echo ${METALLB_HOST} | cut -d '.' -f 1,2,3); 
+             LAST_ADDRESS_DIGIT=${METALLB_HOST:\ -1};
+             function createif() {
+               mkdir /var/run/netns;
+               ln -sfT /default-ns/net /var/run/netns/host-default;
+               ln -sfT /proc/1/ns/net /var/run/netns/container-default;
+               ip -n host-default link add link eth0 name ${MACVTAP_IF} type macvtap;
+               ip -n host-default link set metallb-bgp netns container-default;
+               ip -n container-default a a ${SUBNET}.${1}/24 dev metallb-bgp;
+               ip -n container-default link set up dev metallb-bgp;
+             }
+
+             echo $METALLB_NODE_NAME | fgrep master 1> /dev/null && {
+               createif 25${LAST_ADDRESS_DIGIT};
+             }
+
+             echo $METALLB_NODE_NAME | fgrep node 1> /dev/null && {
+               createif 24${LAST_ADDRESS_DIGIT};
+             }
+
+             exit 0;
+      containers:
+      - args:
+        - --port=7472
+        - --config=config
+        env:
+        - name: METALLB_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: METALLB_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: METALLB_ML_BIND_ADDR
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # needed when another software is also using memberlist / port 7946
+        #- name: METALLB_ML_BIND_PORT
+        #  value: "7946"
+        - name: METALLB_ML_LABELS
+          value: "app=metallb,component=speaker"
+        - name: METALLB_ML_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: METALLB_ML_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: memberlist
+              key: secretkey
+        image: metallb/speaker:v0.9.6
+        imagePullPolicy: Always
+        name: speaker
+        ports:
+        - containerPort: 7472
+          name: monitoring
+        resources:
+          limits:
+            cpu: 100m
+            memory: 100Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - NET_ADMIN
+            - NET_RAW
+            - SYS_ADMIN
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+      #hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      serviceAccountName: speaker
+      terminationGracePeriodSeconds: 2
+      tolerations:
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
